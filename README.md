@@ -45,13 +45,15 @@ def triton_linear_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, e
 Compared against naive linear attention wrapped with ```torch.compile``` and ```CausalDotProduct``` from ```fast-transformers```.
 
 **Forward:**
-<img src="imgs/linear_fwd_128_32.png" width="300" height="300">
-<img src="imgs/linear_fwd_64_32.png" width="300" height="300">
+
+<img src="imgs/linear_fwd_128_32.png" width="500" height="500">
+<img src="imgs/linear_fwd_64_32.png" width="500" height="500">
 
 
 **Forward+Backward:**
-<img src="imgs/linear_fwd_bwd_128_32.png" width="300" height="300">
-<img src="imgs/linear_fwd_bwd_64_32.png" width="300" height="300">
+
+<img src="imgs/linear_fwd_bwd_128_32.png" width="500" height="500">
+<img src="imgs/linear_fwd_bwd_64_32.png" width="500" height="500">
 
 Further optimization and tuning is needed to reach optimal performance, but this kernel is fast enough for now. 
 

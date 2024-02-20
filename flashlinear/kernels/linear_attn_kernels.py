@@ -13,7 +13,7 @@ def linear_flash_attn_fwd(
     q_ptr,k_ptr,v_ptr,o_ptr,
     qkv_stride_b,qkv_stride_h,
     qkv_stride_sq,qkv_stride_hd,
-    BLOCK_HD: tl.constexpr,BLOCK_SQ: tl.constexpr,
+    BLOCK_HD: tl.constexpr, BLOCK_SQ: tl.constexpr, BLOCK_SK: tl.constexpr,
     num_head,head_dim, context_sq,
 ):
 #fmt: on
@@ -38,7 +38,7 @@ def linear_flash_attn_fwd(
     k_block_ptr = tl.make_block_ptr(
         k_ptr + bh_offset,
         shape=(head_dim, context_sq),
-        block_shape=(BLOCK_HD, BLOCK_SQ),
+        block_shape=(BLOCK_HD, BLOCK_SK),
         strides=(qkv_stride_hd, qkv_stride_sq),
         order=(0, 1),
         offsets=(0, 0),
@@ -47,7 +47,7 @@ def linear_flash_attn_fwd(
     v_block_ptr = tl.make_block_ptr(
         v_ptr + bh_offset,
         shape=(context_sq, head_dim),
-        block_shape=(BLOCK_SQ, BLOCK_HD),
+        block_shape=(BLOCK_SK, BLOCK_HD),
         strides=(qkv_stride_sq, qkv_stride_hd),
         order=(1, 0),
         offsets=(0, 0),
@@ -57,12 +57,13 @@ def linear_flash_attn_fwd(
 
     q = tl.load(q_block_ptr, boundary_check=(1,))
 
-    max_range = q_chunk_pid * BLOCK_SQ + 1
+    offs_q = (q_chunk_pid * BLOCK_SQ) + tl.arange(0, BLOCK_SQ)
+    offs_k = tl.arange(0, BLOCK_SK)
 
-    offs_k = tl.arange(0, BLOCK_SQ)
-    offs_q = tl.arange(0, BLOCK_SQ)
+    for start_k in range(0, (q_chunk_pid + 1) * BLOCK_SQ, BLOCK_SK):
 
-    for chunk in range(0, max_range - 1, BLOCK_SQ):
+        start_k = tl.multiple_of(start_k, BLOCK_SK)
+
         k = tl.load(
             k_block_ptr, boundary_check=(0,)
         )
@@ -72,27 +73,16 @@ def linear_flash_attn_fwd(
 
         s_ij = tl.dot(q, k, allow_tf32=False)  # [BLOCK_SQ, BLOCK_SK]
 
+        s_ij = tl.where(
+            offs_q[:, None] >= (start_k + offs_k[None, :]),
+            s_ij,
+            0.0,
+        )
+
         out += tl.dot(s_ij.to(tl.bfloat16), v, allow_tf32=False)
 
-        k_block_ptr = tl.advance(k_block_ptr, offsets=(0, BLOCK_SQ))
-        v_block_ptr = tl.advance(v_block_ptr, offsets=(BLOCK_SQ, 0))
-
-    # final block - we reuse code here to remove conditionals from for loop
-    k = tl.load(
-        k_block_ptr, boundary_check=(0,)
-    )
-    v = tl.load(
-        v_block_ptr, boundary_check=(1,)
-    )
-    s_ij = tl.dot(q, k, allow_tf32=False)  # [BLOCK_SQ, BLOCK_SK]
-    offs = max_range - 1
-    s_ij = tl.where(
-        q_chunk_pid * BLOCK_SQ + offs_k[:, None] >= (offs + offs_q[None, :]),
-        s_ij,
-        0.0,
-    )
-
-    out += tl.dot(s_ij.to(tl.bfloat16), v, allow_tf32=False)
+        k_block_ptr = tl.advance(k_block_ptr, offsets=(0, BLOCK_SK))
+        v_block_ptr = tl.advance(v_block_ptr, offsets=(BLOCK_SK, 0))
 
     out_block_ptr = tl.make_block_ptr(
         o_ptr + bh_offset,
@@ -118,6 +108,7 @@ def flash_attn_bwd(
     qkv_stride_sq,qkv_stride_hd,
     BLOCK_HD: tl.constexpr,
     BLOCK_SQ: tl.constexpr,
+    BLOCK_SK: tl.constexpr,
     context_sq,head_dim, num_head,
 ):
 # fmt: on
@@ -133,7 +124,7 @@ def flash_attn_bwd(
     q_block_ptr = tl.make_block_ptr(
         q_ptr + bh_offset,
         shape=(context_sq, head_dim),
-        block_shape=(BLOCK_SQ, BLOCK_HD),
+        block_shape=(BLOCK_SK, BLOCK_HD),
         strides=(qkv_stride_sq, qkv_stride_hd),
         order=(1, 0),
         offsets=(0, 0),
@@ -142,7 +133,7 @@ def flash_attn_bwd(
     dout_block_ptr = tl.make_block_ptr(
         dO_ptr + bh_offset,
         shape=(context_sq, head_dim),
-        block_shape=(BLOCK_SQ, BLOCK_HD),
+        block_shape=(BLOCK_SK, BLOCK_HD),
         strides=(qkv_stride_sq, qkv_stride_hd),
         order=(1, 0),
         offsets=(0, 0),
@@ -173,13 +164,11 @@ def flash_attn_bwd(
     v_trans = tl.load(v_block_ptr, boundary_check=(0,))
 
     max_range = context_sq
-    min_range = kv_chunk_pid * BLOCK_SQ
 
-    offs_k = tl.arange(0, BLOCK_SQ)
+    offs_k = tl.arange(0, BLOCK_SK)
     offs_q = (kv_chunk_pid * BLOCK_SQ) + tl.arange(0, BLOCK_SQ)
 
-    # loop is split into pre/post masking to remove conditional use
-    for q_chunk in range(0, min_range + 1, BLOCK_SQ):
+    for start_k in range(0, max_range, BLOCK_SK):
         q = tl.load(
             q_block_ptr, boundary_check=(1,)
         )
@@ -190,7 +179,7 @@ def flash_attn_bwd(
         S_ij = tl.dot(q, k_trans, allow_tf32=False)
 
         S_ij = tl.where(
-            (q_chunk + offs_k[:, None]) >= (offs_q[None, :]),
+            (start_k + offs_k[:, None]) >= (offs_q[None, :]),
             S_ij,
             0.0,
         )
@@ -200,36 +189,15 @@ def flash_attn_bwd(
         dS_ij = tl.dot(dout, v_trans, allow_tf32=False)
 
         dS_ij = tl.where(
-            (q_chunk + offs_k[:, None]) >= (offs_q[None, :]),
+            (start_k + offs_k[:, None]) >= (offs_q[None, :]),
             dS_ij,
             0.0,
         )
 
         dK += tl.dot(tl.trans(dS_ij.to(tl.bfloat16)), q, allow_tf32=False)
 
-        q_block_ptr = tl.advance(q_block_ptr, offsets=(BLOCK_SQ, 0))
-        dout_block_ptr = tl.advance(dout_block_ptr, offsets=(BLOCK_SQ, 0))
-
-    min_range_offset = min_range + BLOCK_SQ
-
-    for q_chunk in range(min_range_offset, max_range, BLOCK_SQ):
-        q = tl.load(
-            q_block_ptr, boundary_check=(1,)
-        )
-        dout = tl.load(
-            dout_block_ptr, boundary_check=(1,)
-        )
-
-        S_ij = tl.dot(q, k_trans, allow_tf32=False)
-
-        dV += tl.dot(tl.trans(S_ij.to(tl.bfloat16)), dout, allow_tf32=False)
-
-        dS_ij = tl.dot(dout, v_trans, allow_tf32=False)
-
-        dK += tl.dot(tl.trans(dS_ij.to(tl.bfloat16)), q, allow_tf32=False)
-
-        q_block_ptr = tl.advance(q_block_ptr, offsets=(BLOCK_SQ, 0))
-        dout_block_ptr = tl.advance(dout_block_ptr, offsets=(BLOCK_SQ, 0))
+        q_block_ptr = tl.advance(q_block_ptr, offsets=(BLOCK_SK, 0))
+        dout_block_ptr = tl.advance(dout_block_ptr, offsets=(BLOCK_SK, 0))
 
     dV_block_ptr = tl.make_block_ptr(
         dV_ptr + bh_offset,
@@ -293,7 +261,7 @@ def flash_attn_bwd(
     k_block_ptr = tl.make_block_ptr(
         k_ptr + bh_offset,
         shape=(head_dim, context_sq),
-        block_shape=(BLOCK_HD, BLOCK_SQ),
+        block_shape=(BLOCK_HD, BLOCK_SK),
         strides=(qkv_stride_hd, qkv_stride_sq),
         order=(0, 1),
         offsets=(0, 0),
@@ -302,7 +270,7 @@ def flash_attn_bwd(
     v_block_ptr = tl.make_block_ptr(
         v_ptr + bh_offset,
         shape=(head_dim, context_sq),
-        block_shape=(BLOCK_HD, BLOCK_SQ),
+        block_shape=(BLOCK_HD, BLOCK_SK),
         strides=(qkv_stride_hd, qkv_stride_sq),
         order=(0, 1),
         offsets=(0, 0),
@@ -314,16 +282,15 @@ def flash_attn_bwd(
 
     dQ = tl.zeros([BLOCK_SQ, BLOCK_HD], dtype=tl.float32)
 
-    offs_k = tl.arange(0, BLOCK_SQ)
-
-    max_range = kv_chunk_pid * BLOCK_SQ + 1
-    final = max_range - 1
+    
+    offs_q = kv_chunk_pid * BLOCK_SQ + tl.arange(0, BLOCK_SQ)
+    offs_k = tl.arange(0, BLOCK_SK)
 
     dout = tl.load(
         dout_block_ptr, boundary_check=(1,)
     )
 
-    for q_chunk in range(0, final, BLOCK_SQ):
+    for start_k in range(0, (kv_chunk_pid+1) * BLOCK_SQ, BLOCK_SK):
         v_trans = tl.load(
             v_block_ptr, boundary_check=(0,)
         )
@@ -331,36 +298,18 @@ def flash_attn_bwd(
             k_block_ptr, boundary_check=(0,)
         )
 
-        S_ij = tl.dot(q, k_trans, allow_tf32=False)
-
         dS_ij = tl.dot(dout, v_trans, allow_tf32=False)
+
+        dS_ij = tl.where(
+            offs_q[:, None] >= (start_k + offs_k[None, :]),
+            dS_ij,
+            0.0,
+        )
 
         dQ += tl.dot(dS_ij.to(tl.bfloat16), tl.trans(k_trans), allow_tf32=False)
 
-        v_block_ptr = tl.advance(v_block_ptr, offsets=(0, BLOCK_SQ))
-        k_block_ptr = tl.advance(k_block_ptr, offsets=(0, BLOCK_SQ))
-
-    v_trans = tl.load(v_block_ptr, boundary_check=(0,))
-    k_trans = tl.load(k_block_ptr, boundary_check=(0,))
-
-    S_ij = tl.dot(q, k_trans, allow_tf32=False)
-
-    # causal masking on final block
-    S_ij = tl.where(
-        kv_chunk_pid * BLOCK_SQ + offs_k[:, None] >= (final + offs_k[None, :]),
-        S_ij,
-        0.0,
-    )
-
-    dS_ij = tl.dot(dout, v_trans, allow_tf32=False)
-
-    dS_ij = tl.where(
-        kv_chunk_pid * BLOCK_SQ + offs_k[:, None] >= (final + offs_k[None, :]),
-        dS_ij,
-        0.0,
-    )
-
-    dQ += tl.dot(dS_ij.to(tl.bfloat16), tl.trans(k_trans), allow_tf32=False)
+        v_block_ptr = tl.advance(v_block_ptr, offsets=(0, BLOCK_SK))
+        k_block_ptr = tl.advance(k_block_ptr, offsets=(0, BLOCK_SK))
 
     tl.store(
         dQ_block_ptr,
@@ -376,6 +325,8 @@ def linear_flash_wrapper_fwd(
 
     BLOCK_HD = triton.next_power_of_2(hd)
     BLOCK_SQ = 64 if BLOCK_HD <= 128 else 32
+    BLOCK_SK = 32
+
     num_warps = 4 if BLOCK_HD < 128 else 8 
     
     assert hd <= 256, "Only head_dims <= 256 are supported."
@@ -392,7 +343,7 @@ def linear_flash_wrapper_fwd(
     linear_flash_attn_fwd[grid](
         q,k,v,out,
         q.stride(0),q.stride(1),q.stride(2),q.stride(3),
-        BLOCK_HD=BLOCK_HD,BLOCK_SQ=BLOCK_SQ,
+        BLOCK_HD=BLOCK_HD,BLOCK_SQ=BLOCK_SQ,BLOCK_SK=BLOCK_SK,
         num_warps=num_warps,num_stages=2,
         context_sq=sq,num_head=nh, head_dim=hd
     )
@@ -412,9 +363,11 @@ def linear_flash_wrapper_bwd(
 
     BLOCK_HD = triton.next_power_of_2(hd)
     BLOCK_SQ = 64 if BLOCK_HD <= 128 else 32
+    BLOCK_SK = 64
 
-    num_warps = 4 # TODO: Find good values
+    num_warps = 4 
 
+    assert BLOCK_SK == BLOCK_SQ, "Kernel currently only supports `BLOCK_SK == BLOCK_SQ`"
     assert hd <= 256, "Only head_dims <= 256 are supported."
     assert (
         sq % BLOCK_SQ == 0
@@ -433,7 +386,7 @@ def linear_flash_wrapper_bwd(
         grad_output,
         dV,dK,dQ,
         q.stride(0),q.stride(1),q.stride(2),q.stride(3),
-        BLOCK_HD=BLOCK_HD,BLOCK_SQ=BLOCK_SQ,
+        BLOCK_HD=BLOCK_HD,BLOCK_SQ=BLOCK_SQ,BLOCK_SK=BLOCK_SK,
         num_warps=num_warps,num_stages=1,
         context_sq=sq,num_head=nh,head_dim=hd
     )

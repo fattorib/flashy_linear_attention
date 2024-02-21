@@ -65,7 +65,6 @@ pytest flashlinear/test_*
 
 ## Todos
 
-- [ ] Add support for `BLOCK_SQ != BLOCK_SK` in backward pass. 
 - [ ] Use `triton.autotune` instead of hand-picked configs. 
 
 ## References

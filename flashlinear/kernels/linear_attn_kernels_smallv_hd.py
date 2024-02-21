@@ -85,8 +85,8 @@ def linear_flash_attn_fwd(
 
         out += tl.dot(s_ij.to(tl.bfloat16), v, allow_tf32=False)
 
-        k_block_ptr = tl.advance(k_block_ptr, offsets=(0, BLOCK_SQ))
-        v_block_ptr = tl.advance(v_block_ptr, offsets=(BLOCK_SQ, 0))
+        k_block_ptr = tl.advance(k_block_ptr, offsets=(0, BLOCK_SK))
+        v_block_ptr = tl.advance(v_block_ptr, offsets=(BLOCK_SK, 0))
 
     
 
@@ -252,16 +252,7 @@ def flash_attn_bwd(
         offsets=(kv_chunk_pid * BLOCK_SQ, 0),
     )
 
-    q_block_ptr = tl.make_block_ptr(
-        q_ptr + bh_offset,
-        shape=(context_sq, head_dim),
-        block_shape=(BLOCK_SQ, BLOCK_HD),
-        strides=(qk_stride_sq, qk_stride_hd),
-        order=(1, 0),
-        offsets=(kv_chunk_pid * BLOCK_SQ, 0),
-    )
-
-    k_block_ptr = tl.make_block_ptr(
+    k_block_ptr_epi = tl.make_block_ptr(
         k_ptr + bh_offset,
         shape=(head_dim, context_sq),
         block_shape=(BLOCK_HD, BLOCK_SK),
@@ -281,17 +272,13 @@ def flash_attn_bwd(
         offsets=(kv_chunk_pid * BLOCK_SQ, 0),
     )
 
-    v_block_ptr = tl.make_block_ptr(
+    v_block_ptr_epi = tl.make_block_ptr(
         v_ptr + bh_offset,
         shape=(BLOCK_HD_V, context_sq),
         block_shape=(BLOCK_HD_V, BLOCK_SK),
         strides=(v_stride_hd, v_stride_sq),
         order=(0, 1),
         offsets=(0, 0),
-    )
-
-    q = tl.load(
-        q_block_ptr, boundary_check=(1,)
     )
 
     dQ = tl.zeros([BLOCK_SQ, BLOCK_HD], dtype=tl.float32)
@@ -304,14 +291,14 @@ def flash_attn_bwd(
     )
 
     for start_k in range(0, (kv_chunk_pid+1) * BLOCK_SQ, BLOCK_SK):
-        v_trans = tl.load(
-            v_block_ptr, boundary_check=(0,)
+        v_trans_epi = tl.load(
+            v_block_ptr_epi, boundary_check=(0,)
         )
-        k_trans = tl.load(
-            k_block_ptr, boundary_check=(0,)
+        k_trans_epi = tl.load(
+            k_block_ptr_epi, boundary_check=(0,)
         )
 
-        dS_ij = tl.dot(dout, v_trans, allow_tf32=False)
+        dS_ij = tl.dot(dout, v_trans_epi, allow_tf32=False)
 
         dS_ij = tl.where(
             offs_q[:, None] >= (start_k + offs_k[None, :]),
@@ -319,10 +306,10 @@ def flash_attn_bwd(
             0.0,
         )
 
-        dQ += tl.dot(dS_ij.to(tl.bfloat16), tl.trans(k_trans), allow_tf32=False)
+        dQ += tl.dot(dS_ij.to(tl.bfloat16), tl.trans(k_trans_epi), allow_tf32=False)
 
-        v_block_ptr = tl.advance(v_block_ptr, offsets=(0, BLOCK_SK))
-        k_block_ptr = tl.advance(k_block_ptr, offsets=(0, BLOCK_SK))
+        v_block_ptr_epi = tl.advance(v_block_ptr_epi, offsets=(0, BLOCK_SK))
+        k_block_ptr_epi = tl.advance(k_block_ptr_epi, offsets=(0, BLOCK_SK))
 
     tl.store(
         dQ_block_ptr,
@@ -386,13 +373,11 @@ def linear_flash_wrapper_bwd_smallv_hd(
 
     BLOCK_HD = triton.next_power_of_2(hd_qk)
     BLOCK_HD_V = triton.next_power_of_2(hd_v)
-    BLOCK_SK = 64
-
     BLOCK_SQ = 64
+    BLOCK_SK = 32
 
     num_warps = 4
 
-    assert BLOCK_SK == BLOCK_SQ, "Kernel currently only supports `BLOCK_SK == BLOCK_SQ`"
     assert hd_qk <= 256, "Only head_dims <= 256 are supported."
     assert (
         sq % BLOCK_SQ == 0
